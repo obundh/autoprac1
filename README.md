@@ -45,9 +45,9 @@
 
 ## 스크린샷
 
-![안전 고지](docs/screenshots/notice.png)
+![안전 고지](docs/screenshots/notice.svg)
 
-![메인 화면](docs/screenshots/main.png)
+![메인 화면](docs/screenshots/main.svg)
 
 ## 실행
 
