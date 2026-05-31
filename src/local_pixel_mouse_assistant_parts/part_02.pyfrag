@@ -1,0 +1,240 @@
+        if not self.user32.GetCursorPos(ctypes.byref(point)):
+            raise OSError(ctypes.get_last_error(), "GetCursorPos failed")
+        return point.x, point.y
+
+    def pixel_at(self, x: int, y: int) -> tuple[int, int, int]:
+        screen_dc = self.user32.GetDC(None)
+        if not screen_dc:
+            raise OSError(ctypes.get_last_error(), "GetDC failed")
+        try:
+            color = self.gdi32.GetPixel(screen_dc, x, y)
+            if color == 0xFFFFFFFF:
+                raise OSError(ctypes.get_last_error(), "GetPixel failed")
+            red = color & 0xFF
+            green = (color >> 8) & 0xFF
+            blue = (color >> 16) & 0xFF
+            return red, green, blue
+        finally:
+            self.user32.ReleaseDC(None, screen_dc)
+
+    def move_mouse(self, x: int, y: int) -> None:
+        if not self.user32.SetCursorPos(int(x), int(y)):
+            raise OSError(ctypes.get_last_error(), "SetCursorPos failed")
+
+    def click_left(self, x: int, y: int, press_ms: int = 35) -> None:
+        self.move_mouse(x, y)
+        time.sleep(0.02)
+        self.user32.mouse_event(self.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, None)
+        time.sleep(max(0.005, press_ms / 1000))
+        self.user32.mouse_event(self.MOUSEEVENTF_LEFTUP, 0, 0, 0, None)
+
+    def left_button_down(self) -> bool:
+        return bool(self.user32.GetAsyncKeyState(self.VK_LBUTTON) & 0x8000)
+
+    def right_button_down(self) -> bool:
+        return bool(self.user32.GetAsyncKeyState(self.VK_RBUTTON) & 0x8000)
+
+    def escape_down(self) -> bool:
+        return bool(self.user32.GetAsyncKeyState(self.VK_ESCAPE) & 0x8000)
+
+    def capture_screen(self) -> tuple[bytes, int, int, int, int]:
+        left, top, width, height = self.virtual_bounds()
+        return self.capture_region(left, top, width, height)
+
+    def capture_region(
+        self, left: int, top: int, width: int, height: int
+    ) -> tuple[bytes, int, int, int, int]:
+        left = int(left)
+        top = int(top)
+        width = int(width)
+        height = int(height)
+        if width <= 0 or height <= 0:
+            raise ValueError("캡처 영역의 너비와 높이는 1 이상이어야 합니다.")
+
+        screen_dc = self.user32.GetDC(None)
+        if not screen_dc:
+            raise OSError(ctypes.get_last_error(), "GetDC failed")
+
+        mem_dc = self.gdi32.CreateCompatibleDC(screen_dc)
+        if not mem_dc:
+            self.user32.ReleaseDC(None, screen_dc)
+            raise OSError(ctypes.get_last_error(), "CreateCompatibleDC failed")
+
+        bitmap = self.gdi32.CreateCompatibleBitmap(screen_dc, width, height)
+        if not bitmap:
+            self.gdi32.DeleteDC(mem_dc)
+            self.user32.ReleaseDC(None, screen_dc)
+            raise OSError(ctypes.get_last_error(), "CreateCompatibleBitmap failed")
+
+        old_object = self.gdi32.SelectObject(mem_dc, bitmap)
+        try:
+            if not self.gdi32.BitBlt(
+                mem_dc,
+                0,
+                0,
+                width,
+                height,
+                screen_dc,
+                left,
+                top,
+                self.SRCCOPY,
+            ):
+                raise OSError(ctypes.get_last_error(), "BitBlt failed")
+
+            bmi = BitmapInfo()
+            bmi.bmiHeader.biSize = ctypes.sizeof(BitmapInfoHeader)
+            bmi.bmiHeader.biWidth = width
+            bmi.bmiHeader.biHeight = -height
+            bmi.bmiHeader.biPlanes = 1
+            bmi.bmiHeader.biBitCount = 32
+            bmi.bmiHeader.biCompression = self.BI_RGB
+            bmi.bmiHeader.biSizeImage = width * height * 4
+
+            buffer = ctypes.create_string_buffer(width * height * 4)
+            lines = self.gdi32.GetDIBits(
+                mem_dc,
+                bitmap,
+                0,
+                height,
+                buffer,
+                ctypes.byref(bmi),
+                self.DIB_RGB_COLORS,
+            )
+            if lines == 0:
+                raise OSError(ctypes.get_last_error(), "GetDIBits failed")
+
+            return buffer.raw, left, top, width, height
+        finally:
+            if old_object:
+                self.gdi32.SelectObject(mem_dc, old_object)
+            self.gdi32.DeleteObject(bitmap)
+            self.gdi32.DeleteDC(mem_dc)
+            self.user32.ReleaseDC(None, screen_dc)
+
+
+def find_matching_pixel(
+    data: bytes,
+    width: int,
+    height: int,
+    left: int,
+    top: int,
+    target: tuple[int, int, int],
+    tolerance: int,
+    step: int,
+) -> tuple[int, int, tuple[int, int, int]] | None:
+    target_red, target_green, target_blue = target
+    row_stride = width * 4
+
+    for y in range(0, height, step):
+        row_offset = y * row_stride
+        for x in range(0, width, step):
+            offset = row_offset + (x * 4)
+            blue = data[offset]
+            green = data[offset + 1]
+            red = data[offset + 2]
+
+            if (
+                abs(red - target_red) <= tolerance
+                and abs(green - target_green) <= tolerance
+                and abs(blue - target_blue) <= tolerance
+            ):
+                return left + x, top + y, (red, green, blue)
+
+    return None
+
+
+class EyedropperOverlay:
+    """Full-screen picker overlay with a cursor-side color preview."""
+
+    TRANSPARENT_COLOR = "#FF00FF"
+    PANEL_WIDTH = 178
+    PANEL_HEIGHT = 58
+
+    def __init__(
+        self,
+        root: tk.Tk,
+        screen: WindowsScreen,
+        on_pick: Callable[[tuple[int, int, int], int, int], None],
+        on_cancel: Callable[[], None],
+        on_error: Callable[[Exception], None],
+    ) -> None:
+        self.root = root
+        self.screen = screen
+        self.on_pick = on_pick
+        self.on_cancel = on_cancel
+        self.on_error = on_error
+        self.left, self.top, self.width, self.height = screen.virtual_bounds()
+        self.closed = False
+        self.waiting_for_release = screen.left_button_down()
+        self.current_rgb = (0, 0, 0)
+        self.current_pos = (self.left, self.top)
+        self.grabbed = False
+
+        self.window = tk.Toplevel(root)
+        self.window.withdraw()
+        self.window.overrideredirect(True)
+        self.window.configure(bg=self.TRANSPARENT_COLOR, cursor="none")
+        self.window.geometry(
+            f"{self.width}x{self.height}{self.left:+d}{self.top:+d}"
+        )
+        self.window.attributes("-topmost", True)
+        try:
+            self.window.attributes("-transparentcolor", self.TRANSPARENT_COLOR)
+        except tk.TclError:
+            self.window.attributes("-alpha", 0.12)
+
+        self.canvas = tk.Canvas(
+            self.window,
+            bg=self.TRANSPARENT_COLOR,
+            bd=0,
+            highlightthickness=0,
+            cursor="none",
+        )
+        self.canvas.pack(fill=tk.BOTH, expand=True)
+
+        self.window.bind("<Escape>", self._cancel_from_event)
+        self.window.bind("<Button-1>", self._pick_from_event)
+        self.window.bind("<Button-3>", self._cancel_from_event)
+        self.window.deiconify()
+        self.window.lift()
+        self.window.focus_force()
+        try:
+            self.window.grab_set_global()
+            self.grabbed = True
+        except tk.TclError:
+            self.grabbed = False
+
+        self._poll()
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        if self.grabbed:
+            try:
+                self.window.grab_release()
+            except tk.TclError:
+                pass
+        self.window.destroy()
+
+    def _cancel_from_event(self, _event: tk.Event | None = None) -> None:
+        if self.closed:
+            return
+        self.close()
+        self.on_cancel()
+
+    def _pick_from_event(self, _event: tk.Event | None = None) -> None:
+        if self.closed or self.waiting_for_release:
+            return
+        x, y = self.current_pos
+        rgb = self.current_rgb
+        self.close()
+        self.on_pick(rgb, x, y)
+
+    def _poll(self) -> None:
+        if self.closed:
+            return
+
+        try:
+            x, y = self.screen.cursor_position()
+            rgb = self.screen.pixel_at(x, y)
